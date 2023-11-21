@@ -2,9 +2,11 @@ import numpy as np
 
 from tqdm import tqdm
 from scipy.stats import dirichlet
+from pathlib import Path
 
 from mixing_fractions.montecarlo import MC_integral
-from mixing_fractions.utils import logsumexp_jit
+from mixing_fractions.utils import _logsumexp_jit, summary_files
+from mixing_fractions.plot import single_model_histogram, single_event_histogram, joint_posterior_histogram
 
 class Gibbs:
     """
@@ -15,8 +17,12 @@ class Gibbs:
         iterable models:            formation channels models. Must be an iterable of callables
         iterable event_names:       GW event names
         iterable model_names:       formation channels names
+        str out_folder:             output folder
         double alpha0:              concentration parameter
         int thinning:               number of steps between draws
+        bool verbose:               verbosity of the sampler
+        bool produce_output:        whether to produce output (summary files and plots) or not
+        str colormap:               matplotlib colormap for output plots
     
     Returns:
         Gibbs: instance of Gibbs class
@@ -26,8 +32,12 @@ class Gibbs:
                  models,
                  event_names,
                  model_names,
+                 out_folder = '.',
                  alpha0 = 1.,
                  thinning = 1000,
+                 verbose = True,
+                 produce_output = True,
+                 colormap = 'jet',
                  ):
                  
         self.posterior_samples = posterior_samples
@@ -36,13 +46,22 @@ class Gibbs:
         self.model_names       = model_names
         self.n_events          = len(posterior_samples)
         self.n_models          = len(models)
-        # Sampling setup
+        # Sampler settings
         self.alpha0            = alpha0
         self.alpha             = self.alpha0/self.n_models
         self.thinning          = int(thinning)
+        self.verbose           = verbose
+        self.produce_output    = produce_output
+        self.colormap          = colormap
+        self.out_folder        = Path(out_folder)
+        if not self.out_folder.exists():
+            try:
+                self.out_folder.mkdir()
+            # Avoids issue with parallelisation
+            except FileExistsError:
+                pass
         # Initialisation
         self._evaluate_event_probabilities()
-        self._initialise_assignments()
 
     def _evaluate_event_probabilities(self):
         """
@@ -64,24 +83,24 @@ class Gibbs:
         """
         # Compute probability for categories
         logP_DD    = np.log((self.counts + self.alpha)/(i + self.alpha0)) # Dirichlet Distribution
-        logP       = logP_DD + self.event_probabilities - logsumexp_jit(self.event_probabilities[i], logP_DD)
+        logP       = logP_DD + self.event_probabilities - _logsumexp_jit(self.event_probabilities[i], logP_DD)
         # Draw assignment
         idx        = np.random.choice(self.n_models, p = np.exp(logP))
         return idx
-
+    
     def _initialise_assignments(self):
         """
         Initialise the assignments in a way that ensures immediate thermalisation
         """
-        self.assignments = [None for _ in self.posterior_samples]
-        self.counts      = np.zeros(len(self.models))
-        order            = np.arange(self.n_events)
+        self.z      = np.array([-1 for _ in self.posterior_samples])
+        self.counts = np.zeros(len(self.models))
+        order       = np.arange(self.n_events)
         np.random.shuffle(order)
         for i in order:
             idx = self._draw_assignment(i)
-            self.assignments[i] = idx
-            self.counts[idx]   += 1.
-        
+            self.z[i]         = idx
+            self.counts[idx] += 1.
+    
     def _update_component(self, i):
         """
         Update the component to which event i is assigned to
@@ -94,7 +113,7 @@ class Gibbs:
         self.counts[old_idx] -= 1.
         # Draw new component
         new_idx               = self._draw_assignment(i)
-        self.assignments[i]   = new_idx
+        self.z[i]             = new_idx
         self.counts[new_idx] += 1.
     
     def _draw_mixing_fractions(self):
@@ -114,9 +133,17 @@ class Gibbs:
         event_indexes = np.random.choice(self.n_events, size = self.thinning, replace = True)
         for idx in event_indexes:
             self._update_component(idx)
-        return self._draw_mixing_fractions()
+        sample = self._draw_mixing_fractions()
+        self.samples.append(sample)
+        self.assignments.append(np.copy(self.z))
+        return sample
     
-    def rvs(self, n_draws = 1)
+    def initialise(self):
+        self.samples    = []
+        self.assgnments = []
+        self._initialise_assignments()
+    
+    def rvs(self, n_draws = 1):
         """
         Draw random samples from the distribution
         
@@ -126,4 +153,57 @@ class Gibbs:
         Returns:
             samples: samples for the mixing fractions
         """
-        return np.array([self._draw_sample() for _ in tqdm(range(int(n_draws)), desc = 'Sampling', disable = (n_draws > 1))])
+        self.initialise()
+        return self._rvs(n_draws)
+    
+    def _rvs(self, n_draws = 1):
+        """
+        Draw random samples from the distribution
+        
+        Arguments:
+            int n_draws: number of draws
+        
+        Returns:
+            samples: samples for the mixing fractions
+        """
+        return np.array([self._draw_sample() for _ in tqdm(range(int(n_draws)), desc = 'Sampling', disable = ((n_draws < 2) or (self.verbose is False)))])
+    
+    def make_summary(self):
+        """
+        Produce summary files
+        """
+        if len(samples) > 0:
+            summary_files(self.samples, self.assignments, self.event_names, self.model_names, self.out_folder)
+        else:
+            print('Summary not available without samples')
+    
+    def make_plots(self):
+        """
+        Produce plots
+        """
+        if len(samples) > 0:
+            # Models
+            for model, samples in zip(self.model_names, self.samples.T):
+                single_model_histogram(samples, model, out_folder = self.out_folder)
+            # Events
+            for event, samples in zip(self.event_names, self.assignments.T):
+                single_event_histogram(samples, event, model_names = self.model_names, out_folder = self.out_folder)
+            # Joint
+            joint_posterior_histogram(self.samples, model_names = self.model_names, out_folder = self.out_folder, colormap = self.colormap)
+        else:
+            print('Summary not available without samples')
+    
+    def run(self, n_draws = 1000):
+        """
+        Run the inference and produce plots
+        
+        Arguments:
+            int n_draws: number of draws
+        """
+        self.initialise()
+        self._rvs(n_draws)
+        self.samples     = np.array(self.samples)
+        self.assignments = np.array(self.assignments)
+        self.make_summary()
+        self.make_plots()
+        np.savetxt(Path(self.out_folder, 'posterior_samples.txt'), self.samples)
