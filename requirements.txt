@@ -1,0 +1,4 @@
+numpy
+figaro
+tqdm
+corner
